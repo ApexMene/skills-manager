@@ -1,10 +1,13 @@
-import type { ConfigMap, MapMcpServer, MapSkill, Usage, UsageEntry } from "./tauri";
+import type { ConfigMap, ListingInfo, MapDotDir, MapMcpServer, MapMemoryFile, MapSkill, Usage, UsageEntry } from "./tauri";
 
-export type SkillState = "on" | "manual" | "off";
+/** "name" lists only the skill's name to Claude; "manual" hides it from Claude but keeps `/name`. */
+export type SkillState = "on" | "name" | "manual" | "off";
+export const SKILL_STATES: SkillState[] = ["on", "name", "manual", "off"];
 
 export function normalizeState(state: string): SkillState {
   if (state === "on") return "on";
   if (state === "off") return "off";
+  if (state === "name-only") return "name";
   return "manual";
 }
 
@@ -15,7 +18,7 @@ export function groupBy<T>(items: T[], key: (item: T) => string): Record<string,
 }
 
 export function stateCounts(skills: MapSkill[]): Record<SkillState, number> {
-  const counts: Record<SkillState, number> = { on: 0, manual: 0, off: 0 };
+  const counts: Record<SkillState, number> = { on: 0, name: 0, manual: 0, off: 0 };
   for (const s of skills) counts[normalizeState(s.state)]++;
   return counts;
 }
@@ -78,7 +81,7 @@ export function buildGraph(map: ConfigMap, maxProjects = 12): { nodes: MapNode[]
   });
   nodes.push({
     id: "claude-json", column: 0, kind: "config", title: ".claude.json", path: "~/.claude.json",
-    stats: [["mcpServers", String(map.mcp_servers.filter((m) => m.scope !== "settings").length)]],
+    stats: [["mcpServers", String(map.mcp_servers.filter((m) => m.agent === "claude" && (m.scope === "user" || m.scope === "project")).length)]],
   });
 
   for (const group of groups) {
@@ -125,10 +128,15 @@ export function buildGraph(map: ConfigMap, maxProjects = 12): { nodes: MapNode[]
   const mcpGroups = groupBy(map.mcp_servers, (m) => `${m.scope}\u0000${m.defined_in}`);
   for (const [key, servers] of Object.entries(mcpGroups)) {
     const [scope, definedIn] = key.split("\u0000");
+    const agent = servers[0].agent;
     const id = `mcp:${key}`;
-    const title = scope === "project" ? definedIn.split("/").pop() || definedIn : definedIn.split("/").pop()!;
+    const last = (p: string) => p.split("/").pop() || p;
+    // A project .mcp.json is named after its folder; another agent's file after the agent.
+    const title = scope === "project-file" ? last(parentDir(definedIn)) : agent !== "claude" ? `${agent} · ${last(definedIn)}` : last(definedIn);
     nodes.push({ id, column: 2, kind: "mcp", title, path: definedIn, chips: servers.map((s) => s.name) });
-    edges.push({ from: scope === "settings" ? "settings" : "claude-json", to: id, kind: "mcp", label: { key: "configMap.edge.servers", count: servers.length } });
+    if (agent === "claude" && scope !== "project-file") {
+      edges.push({ from: scope === "settings" ? "settings" : "claude-json", to: id, kind: "mcp", label: { key: "configMap.edge.servers", count: servers.length } });
+    }
   }
 
   for (const d of map.dot_dirs.filter((d) => d.path !== "~/.claude" && d.path !== "~/.agents").slice(0, maxProjects)) {
@@ -194,4 +202,115 @@ export function treeMatches(node: TreeNode, query: string): boolean {
   if (node.path.toLowerCase().includes(q)) return true;
   if (node.items.some((i) => i.label.toLowerCase().includes(q))) return true;
   return Object.values(node.children).some((c) => treeMatches(c, q));
+}
+
+// ── Context cost: what the skill listing and memory add to every session ──
+
+/** Rough English average; good enough to compare, not to bill. */
+export const CHARS_PER_TOKEN = 4;
+export const tokens = (chars: number) => Math.round(chars / CHARS_PER_TOKEN);
+
+/** One row per skill name: a skill linked between folders is listed once. */
+export function uniqueSkills(skills: MapSkill[]): MapSkill[] {
+  return Object.values(groupBy(skills, (s) => `${s.agent}\u0000${s.name}`)).map((same) => same.find((s) => s.listing_chars > 0) ?? same.find((s) => !s.link) ?? same[0]);
+}
+
+export interface ListingCost {
+  listed: MapSkill[];
+  chars: number;
+  unused: MapSkill[];
+  unusedChars: number;
+}
+
+export function listingCost(map: ConfigMap): ListingCost {
+  const listed = uniqueSkills(map.skills)
+    .filter((s) => s.listing_chars > 0)
+    .sort((a, b) => b.listing_chars - a.listing_chars);
+  const unused = listed.filter((s) => !skillUsage(map.usage, s));
+  const sum = (list: MapSkill[]) => list.reduce((n, s) => n + s.listing_chars, 0);
+  return { listed, chars: sum(listed), unused, unusedChars: sum(unused) };
+}
+
+/**
+ * Characters Claude Code allows the skill listing for a context window: the
+ * SLASH_COMMAND_TOOL_CHAR_BUDGET override, else a fraction (default 1%) of the
+ * window, in characters.
+ */
+export function listingBudget(info: ListingInfo, windowTokens: number): number {
+  if (info.char_budget) return info.char_budget;
+  return Math.round(windowTokens * (info.budget_fraction ?? 0.01) * CHARS_PER_TOKEN);
+}
+
+// ── Conflicts: one name, more than one definition ──
+
+export interface Conflict {
+  name: string;
+  agent: string;
+  places: string[];
+}
+
+/** Same skill name at different real folders, so which one loads depends on order. */
+export function skillConflicts(skills: MapSkill[]): Conflict[] {
+  const own = skills.filter((s) => s.source !== "plugin");
+  return Object.values(groupBy(own, (s) => `${s.agent}\u0000${s.name}`))
+    .map((same) => ({ name: same[0].name, agent: same[0].agent, places: [...new Set(same.map((s) => s.link ?? s.path))].sort() }))
+    .filter((c) => c.places.length > 1)
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Same MCP server name declared in more than one file for one agent. */
+export function mcpConflicts(servers: MapMcpServer[]): Conflict[] {
+  return Object.values(groupBy(servers, (s) => `${s.agent}\u0000${s.name}`))
+    .map((same) => ({ name: same[0].name, agent: same[0].agent, places: [...new Set(same.map((s) => s.defined_in))].sort() }))
+    .filter((c) => c.places.length > 1)
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// ── Effective config: what Claude Code picks up when started in a folder ──
+
+/** "~/a/b" → ["~", "~/a", "~/a/b"]. */
+export function ancestors(folder: string): string[] {
+  const parts = folder.split("/");
+  return parts.map((_, i) => parts.slice(0, i + 1).join("/"));
+}
+
+export interface EffectiveConfig {
+  folder: string;
+  memory: MapMemoryFile[];
+  memoryChars: number;
+  dotDirs: MapDotDir[];
+  mcp: MapMcpServer[];
+  skills: number;
+}
+
+export function effectiveConfig(map: ConfigMap, folder: string): EffectiveConfig {
+  const chain = new Set(ancestors(folder));
+  // CLAUDE.md files from the folder up to home, plus the user-wide one.
+  // Claude Code reads CLAUDE.md and CLAUDE.local.md; AGENTS.md and GEMINI.md belong to other agents.
+  const memory = map.memory_files.filter((m) => m.file.startsWith("CLAUDE") && (chain.has(m.dir) || m.path === "~/.claude/CLAUDE.md"));
+  const dotDirs = map.dot_dirs.filter((d) => d.kind === ".claude" && chain.has(parentDir(d.path)) && d.path !== "~/.claude");
+  const mcp = map.mcp_servers.filter(
+    (s) =>
+      s.agent === "claude" &&
+      (s.scope === "user" || s.scope === "settings" || (s.scope === "project" && s.defined_in === folder) || (s.scope === "project-file" && chain.has(parentDir(s.defined_in)))),
+  );
+  const userSkills = uniqueSkills(map.skills).filter((s) => s.agent === "claude" && normalizeState(s.state) !== "off").length;
+  return {
+    folder,
+    memory,
+    memoryChars: memory.reduce((n, m) => n + m.size, 0),
+    dotDirs,
+    mcp,
+    skills: userSkills + dotDirs.reduce((n, d) => n + d.skills, 0),
+  };
+}
+
+/** Last `days` days of daily use, oldest first, gaps filled with zero. */
+export function dailySeries(daily: Record<string, number>, days: number, now = Date.now()): Array<{ day: string; count: number }> {
+  const out: Array<{ day: string; count: number }> = [];
+  for (let i = days - 1; i >= 0; i--) {
+    const day = new Date(now - i * 86_400_000).toISOString().slice(0, 10);
+    out.push({ day, count: daily[day] ?? 0 });
+  }
+  return out;
 }

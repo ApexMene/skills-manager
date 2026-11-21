@@ -1181,7 +1181,9 @@
       "mcp": "MCP",
       "memory": "CLAUDE.md",
       "hooks": "Hooks",
-      "usage": "Usage"
+      "usage": "Usage",
+      "context": "Context",
+      "cleanup": "Clean up"
     },
     "columns": {
       "config": "Configuration",
@@ -1201,7 +1203,8 @@
     "state": {
       "on": "on",
       "manual": "manual",
-      "off": "off"
+      "off": "off",
+      "name": "name only"
     },
     "stats": {
       "overrides": "Skill overrides",
@@ -1233,7 +1236,8 @@
     "scope": {
       "user": "user",
       "project": "project",
-      "settings": "settings"
+      "settings": "settings",
+      "project-file": ".mcp.json"
     },
     "usage": {
       "sessions": "Sessions read",
@@ -1246,8 +1250,6 @@
       "usedLine_other": "{{count}} uses · {{days}}d ago",
       "calls_one": "{{count}} call",
       "calls_other": "{{count}} calls",
-      "unusedShort_one": "{{count}} unused",
-      "unusedShort_other": "{{count}} unused",
       "filter": {
         "unused": "Never used",
         "used": "Used",
@@ -1256,7 +1258,69 @@
       "elsewhere": "Used, but not in any config file (built-ins, plugins, connectors)",
       "daysAgo_zero": "today",
       "daysAgo_one": "{{count}} day ago",
-      "daysAgo_other": "{{count}} days ago"
+      "daysAgo_other": "{{count}} days ago",
+      "usedOf": "{{used}}/{{total}} used",
+      "tracked_one": "This app has kept its own history since {{date}} ({{count}} session with skill or MCP use), so counts survive when transcripts are deleted.",
+      "tracked_other": "This app has kept its own history since {{date}} ({{count}} sessions with skill or MCP use), so counts survive when transcripts are deleted.",
+      "perDay": "Skill and MCP uses per day, last 60 days"
+    },
+    "context": {
+      "intro": "Every Claude Code session starts with the skill listing (name, description and when_to_use of each listed skill) and your CLAUDE.md files. Tokens are estimated at 4 characters each.",
+      "listed": "Skills in the listing",
+      "listing": "Skill listing",
+      "unused": "Spent on unused skills",
+      "unusedHint_one": "{{count}} listed skill never used",
+      "unusedHint_other": "{{count}} listed skills never used",
+      "globalMemory": "Global CLAUDE.md",
+      "tokens": "≈{{count}} tok",
+      "chars": "{{count}} characters",
+      "budget": "Listing budget",
+      "window": "{{count}}k context window",
+      "ofBudget": "{{used}} / {{budget}} characters · {{pct}}%",
+      "over": "Over budget: not every description fits, so Claude sees some skills by name only.",
+      "showAll": "Show all {{count}}"
+    },
+    "cleanup": {
+      "intro": "Changes here edit your Claude Code config. Each one shows a preview first and copies the file to a backup before writing.",
+      "unusedTitle": "Listed but never used ({{count}})",
+      "unusedHint": "Personal skills that cost context in every session and were not used in the transcripts and history ({{days}}-day transcript window). Name only keeps them reachable by name; off hides them from Claude and from the / menu.",
+      "pluginNote_one": "{{count}} unused plugin skill is not listed here: plugin skills follow their plugin.",
+      "pluginNote_other": "{{count}} unused plugin skills are not listed here: plugin skills follow their plugin.",
+      "to": {
+        "name-only": "Name only",
+        "off": "Off"
+      },
+      "selectAll": "Select all",
+      "selectNone": "Select none",
+      "applySkills": "Preview {{count}} changes (≈{{tokens}} tok saved)",
+      "staleTitle": "Projects whose folder is gone ({{count}})",
+      "staleHint": "Entries in ~/.claude.json for folders that no longer exist. Each is checked again when writing.",
+      "applyProjects": "Preview removing {{count}}",
+      "brokenTitle": "Broken skill links ({{count}})",
+      "brokenHint": "Symlinks in skill folders that point to nothing. Remove them by hand; this page does not delete files.",
+      "conflictsTitle": "Same name, more than one definition ({{count}})",
+      "conflictsHint": "A skill name in different real folders, or an MCP server name declared in more than one file for the same agent. Only one of them wins.",
+      "kind": {
+        "skill": "skill",
+        "mcp": "MCP"
+      },
+      "previewTitle": "Will change {{file}}:",
+      "backupNote": "The current file is copied to ~/.skills-manager/config-map-backups/ first. Other keys stay as they are.",
+      "confirm": "Apply",
+      "cancel": "Cancel",
+      "done_one": "{{count}} entry changed. Backup: {{backup}}",
+      "done_other": "{{count}} entries changed. Backup: {{backup}}"
+    },
+    "effective": {
+      "hint": "Click a folder to see what Claude Code loads when started there.",
+      "title": "Started in",
+      "skills": "Skills available",
+      "mcp": "MCP servers",
+      "memory": "CLAUDE.md in context",
+      "memoryFiles": "CLAUDE.md files",
+      "projectDirs": "Project .claude folders · skills",
+      "mcpList": "MCP servers",
+      "note": "Estimate from files on disk: managed policy, local settings and subfolder CLAUDE.md loaded on demand are not included."
     }
   }
 }

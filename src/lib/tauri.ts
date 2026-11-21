@@ -869,11 +869,15 @@ export const deleteGlobalLocalSkill = (agent: string, skillRelativePath: string)
 export interface MapSkill {
   name: string;
   description: string;
-  source: "user" | "agents" | "plugin";
+  source: "user" | "agents" | "plugin" | "codex";
   group: string;
   path: string;
   link: string | null;
+  /** "on", "name-only", "user-invocable-only" or "off". */
   state: string;
+  agent: "claude" | "codex" | "gemini";
+  /** Characters this skill adds to Claude Code's skill listing; 0 when not listed. */
+  listing_chars: number;
 }
 
 export interface MapPlugin {
@@ -890,7 +894,8 @@ export interface MapPlugin {
 
 export interface MapMcpServer {
   name: string;
-  scope: "user" | "project" | "settings";
+  agent: "claude" | "codex" | "gemini";
+  scope: "user" | "project" | "settings" | "project-file";
   defined_in: string;
   transport: string;
   env_keys: string[];
@@ -930,6 +935,21 @@ export interface ConfigMap {
   override_count: number;
   truncated: boolean;
   usage: Usage;
+  listing: ListingInfo;
+  broken_links: BrokenLink[];
+  /** Absolute paths of `.claude.json` projects whose folder no longer exists. */
+  stale_projects: string[];
+}
+
+export interface ListingInfo {
+  max_desc_chars: number;
+  budget_fraction: number | null;
+  char_budget: number | null;
+}
+
+export interface BrokenLink {
+  path: string;
+  target: string;
 }
 
 export interface UsageEntry {
@@ -941,8 +961,22 @@ export interface Usage {
   sessions: number;
   since: string | null;
   retention_days: number;
+  /** Sessions in the app's own history, which outlives the transcripts. */
+  tracked_sessions: number;
+  tracked_since: string | null;
   skills: Record<string, UsageEntry>;
   mcp: Record<string, UsageEntry>;
+  /** Skill and MCP uses per day (YYYY-MM-DD). */
+  daily: Record<string, number>;
+}
+
+export interface ConfigEditResult {
+  backup: string | null;
+  changed: string[];
 }
 
 export const getConfigMap = () => invoke<ConfigMap>("get_config_map");
+export const setConfigSkillStates = (changes: Array<{ name: string; state: string }>) =>
+  invoke<ConfigEditResult>("config_map_set_skill_states", { changes });
+export const removeStaleProjects = (projects: string[]) =>
+  invoke<ConfigEditResult>("config_map_remove_stale_projects", { projects });

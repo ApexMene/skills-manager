@@ -6,6 +6,7 @@ import {
   FileText,
   Folder,
   FolderTree,
+  Gauge,
   Loader2,
   Map as MapIcon,
   Maximize2,
@@ -15,20 +16,29 @@ import {
   Search,
   Server,
   Webhook,
+  Wrench,
   X,
   type LucideIcon,
 } from "lucide-react";
 import { cn } from "../utils";
-import { getConfigMap, type ConfigMap as ConfigMapData } from "../lib/tauri";
+import { getConfigMap, removeStaleProjects, setConfigSkillStates, type ConfigMap as ConfigMapData } from "../lib/tauri";
 import {
   buildGraph,
   buildTree,
+  dailySeries,
   daysSince,
+  effectiveConfig,
   groupBy,
+  listingBudget,
+  listingCost,
+  mcpConflicts,
   mcpUsage,
+  skillConflicts,
   skillUsage,
+  tokens,
   unusedCount,
   normalizeState,
+  SKILL_STATES,
   stateCounts,
   treeMatches,
   type EdgeKind,
@@ -39,10 +49,12 @@ import {
 } from "../lib/configMap";
 import type { MapSkill, Usage } from "../lib/tauri";
 
-type Tab = "map" | "usage" | "tree" | "mcp" | "memory" | "hooks";
+type Tab = "map" | "usage" | "context" | "cleanup" | "tree" | "mcp" | "memory" | "hooks";
 const TABS: Array<{ id: Tab; icon: LucideIcon }> = [
   { id: "map", icon: MapIcon },
   { id: "usage", icon: Activity },
+  { id: "context", icon: Gauge },
+  { id: "cleanup", icon: Wrench },
   { id: "tree", icon: FolderTree },
   { id: "mcp", icon: Server },
   { id: "memory", icon: FileText },
@@ -72,6 +84,7 @@ const EDGE_STROKE: Record<EdgeKind, string> = {
 
 const STATE_PILL: Record<string, string> = {
   on: "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400",
+  name: "bg-sky-500/10 text-sky-600 dark:text-sky-400",
   manual: "bg-amber-500/10 text-amber-600 dark:text-amber-400",
   off: "bg-surface-hover text-muted",
 };
@@ -164,6 +177,8 @@ export function ConfigMap() {
 
       {data && tab === "map" && <MapView data={data} />}
       {data && tab === "usage" && <UsageView data={data} />}
+      {data && tab === "context" && <ContextView data={data} />}
+      {data && tab === "cleanup" && <CleanupView data={data} onChanged={load} />}
       {data && tab === "tree" && <TreeView data={data} />}
       {data && tab === "mcp" && <McpView data={data} />}
       {data && tab === "memory" && <MemoryView data={data} />}
@@ -333,6 +348,7 @@ function MapCard({ node, usage, active, onSelect, refFn }: { node: MapNode; usag
   const { t } = useTranslation();
   const counts = node.skills ? stateCounts(node.skills) : null;
   const unused = node.skills ? unusedCount(usage, node.skills) : 0;
+  const tracked = node.skills?.[0]?.agent === "claude";
   return (
     <div
       ref={refFn}
@@ -350,18 +366,22 @@ function MapCard({ node, usage, active, onSelect, refFn }: { node: MapNode; usag
       <p className="text-[13px] font-medium text-primary truncate" title={node.path}>{node.title}</p>
       {counts && (
         <div className="mt-1.5 flex flex-wrap gap-1">
-          {(["on", "manual", "off"] as const).map((s) =>
+          {SKILL_STATES.map((s) =>
             counts[s] > 0 ? (
               <span key={s} className={`whitespace-nowrap text-[11px] px-1.5 py-px rounded-full ${STATE_PILL[s]}`}>
                 {counts[s]} {t(`configMap.state.${s}`)}
               </span>
             ) : null,
           )}
-          {unused > 0 && (
-            <span className="whitespace-nowrap text-[11px] px-1.5 py-px rounded-full bg-rose-500/10 text-rose-600 dark:text-rose-400">
-              {t("configMap.usage.unusedShort", { count: unused })}
-            </span>
-          )}
+          {/* Usage is its own axis: "x/y used", so it never reads against the on/off counts. */}
+          {tracked && <span
+            className={cn(
+              "whitespace-nowrap text-[11px] px-1.5 py-px rounded-full",
+              unused === node.skills!.length ? "bg-rose-500/10 text-rose-600 dark:text-rose-400" : "bg-surface-hover text-muted",
+            )}
+          >
+            {t("configMap.usage.usedOf", { used: node.skills!.length - unused, total: node.skills!.length })}
+          </span>}
         </div>
       )}
       {node.stats?.map(([k, v]) => (
@@ -462,7 +482,8 @@ function UsageView({ data }: { data: ConfigMapData }) {
   const rows = useMemo(
     () =>
       // A skill linked from ~/.claude/skills into ~/.agents/skills is one skill, not two.
-      Object.values(groupBy(data.skills, (s) => s.name))
+      // Usage comes from Claude Code transcripts, so other agents' skills have none to show.
+      Object.values(groupBy(data.skills.filter((s) => s.agent === "claude"), (s) => s.name))
         .map((same) => same.find((s) => !s.link) ?? same[0])
         .map((s) => ({ skill: s, entry: skillUsage(usage, s) }))
         .sort((a, b) => (b.entry?.count ?? 0) - (a.entry?.count ?? 0) || a.skill.name.localeCompare(b.skill.name)),
@@ -489,7 +510,11 @@ function UsageView({ data }: { data: ConfigMapData }) {
         {usage.since
           ? t("configMap.usage.window", { date: new Date(usage.since).toLocaleDateString(), days: usage.retention_days })
           : t("configMap.usage.noTranscripts")}
+        {usage.tracked_since && " "}
+        {usage.tracked_since &&
+          t("configMap.usage.tracked", { date: new Date(usage.tracked_since).toLocaleDateString(), count: usage.tracked_sessions })}
       </p>
+      <DailyChart daily={usage.daily} />
       <div className="app-segmented w-fit bg-background">
         {(["unused", "used", "all"] as const).map((f) => (
           <button key={f} type="button" className={cn("app-segmented-button", filter === f && "app-segmented-button-active")} onClick={() => setFilter(f)}>
@@ -530,13 +555,16 @@ function TreeView({ data }: { data: ConfigMapData }) {
   const root = useMemo(() => buildTree(data), [data]);
   const [query, setQuery] = useState("");
   const [open, setOpen] = useState<Set<string>>(() => new Set(["~"]));
-  const toggle = (path: string) =>
+  const [folder, setFolder] = useState<string | null>(null);
+  const toggle = (path: string) => {
+    setFolder(path);
     setOpen((prev) => {
       const next = new Set(prev);
       if (next.has(path)) next.delete(path);
       else next.add(path);
       return next;
     });
+  };
 
   return (
     <div className="space-y-3">
@@ -551,14 +579,18 @@ function TreeView({ data }: { data: ConfigMapData }) {
           </span>
         ))}
       </div>
-      <div className="app-panel px-2 py-2 font-mono">
-        <TreeRow node={root} depth={0} query={query} open={open} toggle={toggle} />
+      <p className="text-[12px] text-muted">{t("configMap.effective.hint")}</p>
+      <div className="flex gap-3 items-start">
+        <div className="app-panel flex-1 min-w-0 px-2 py-2 font-mono">
+          <TreeRow node={root} depth={0} query={query} open={open} toggle={toggle} selected={folder} />
+        </div>
+        {folder && <EffectivePanel data={data} folder={folder} onClose={() => setFolder(null)} />}
       </div>
     </div>
   );
 }
 
-function TreeRow({ node, depth, query, open, toggle }: { node: TreeNode; depth: number; query: string; open: Set<string>; toggle: (p: string) => void }) {
+function TreeRow({ node, depth, query, open, toggle, selected }: { node: TreeNode; depth: number; query: string; open: Set<string>; toggle: (p: string) => void; selected: string | null }) {
   const children = Object.values(node.children)
     .filter((c) => treeMatches(c, query))
     .sort((a, b) => a.name.localeCompare(b.name));
@@ -569,9 +601,9 @@ function TreeRow({ node, depth, query, open, toggle }: { node: TreeNode; depth: 
       <div
         role="button"
         tabIndex={0}
-        onClick={() => hasChildren && toggle(node.path)}
-        onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && hasChildren && toggle(node.path)}
-        className="flex items-center gap-1.5 rounded-md px-1.5 py-1 hover:bg-surface-hover cursor-pointer"
+        onClick={() => toggle(node.path)}
+        onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && toggle(node.path)}
+        className={cn("flex items-center gap-1.5 rounded-md px-1.5 py-1 hover:bg-surface-hover cursor-pointer", selected === node.path && "bg-surface-hover")}
         style={{ paddingLeft: depth * 14 + 6 }}
       >
         <ChevronRight className={`w-3.5 h-3.5 text-muted transition-transform ${expanded ? "rotate-90" : ""} ${hasChildren ? "" : "invisible"}`} />
@@ -591,7 +623,7 @@ function TreeRow({ node, depth, query, open, toggle }: { node: TreeNode; depth: 
             </div>
           ))}
           {children.map((c) => (
-            <TreeRow key={c.path} node={c} depth={depth + 1} query={query} open={open} toggle={toggle} />
+            <TreeRow key={c.path} node={c} depth={depth + 1} query={query} open={open} toggle={toggle} selected={selected} />
           ))}
         </>
       )}
@@ -630,13 +662,16 @@ function McpView({ data }: { data: ConfigMapData }) {
       )}
       {Object.entries(groups).map(([where, servers]) => (
         <div key={where}>
-          <h2 className="app-section-title mb-1.5">{where} · {t(`configMap.scope.${servers[0].scope}`)}</h2>
+          <h2 className="app-section-title mb-1.5">
+            {where} · {servers[0].agent !== "claude" && `${servers[0].agent} · `}
+            {t(`configMap.scope.${servers[0].scope}`)}
+          </h2>
           <div className="app-panel divide-y divide-border-subtle">
             {servers.map((s) => (
               <div key={s.name} className="flex items-center justify-between gap-3 px-3.5 py-2">
                 <span className="text-[13px] text-primary">{s.name}</span>
                 <span className="flex items-center gap-1.5">
-                  <McpUsagePill entry={mcpUsage(data.usage, s)} />
+                  {s.agent === "claude" && <McpUsagePill entry={mcpUsage(data.usage, s)} />}
                   {s.env_keys.map((k) => <span key={k} className="text-[11px] px-1.5 py-px rounded-full bg-surface-hover text-muted border border-border-subtle font-mono">{k}</span>)}
                   <span className="text-[11px] px-1.5 py-px rounded-full bg-amber-500/10 text-amber-600 dark:text-amber-400">{s.transport}</span>
                 </span>
@@ -690,5 +725,345 @@ function HooksView({ data }: { data: ConfigMapData }) {
         </div>
       ))}
     </div>
+  );
+}
+
+// ── Usage over time ──
+
+function DailyChart({ daily }: { daily: Record<string, number> }) {
+  const { t } = useTranslation();
+  const series = useMemo(() => dailySeries(daily, 60), [daily]);
+  const max = Math.max(1, ...series.map((d) => d.count));
+  return (
+    <div className="app-panel px-4 py-3">
+      <p className="app-section-title mb-2">{t("configMap.usage.perDay")}</p>
+      <div className="flex h-16 items-end gap-px">
+        {series.map((d) => (
+          <div
+            key={d.day}
+            title={`${d.day} · ${d.count}`}
+            className={cn("flex-1", d.count ? "bg-accent" : "bg-surface-hover")}
+            style={{ height: d.count ? `${Math.max(8, (d.count / max) * 100)}%` : "2px" }}
+          />
+        ))}
+      </div>
+      <div className="mt-1 flex justify-between text-[11px] text-muted">
+        <span>{series[0].day}</span>
+        <span>{series[series.length - 1].day}</span>
+      </div>
+    </div>
+  );
+}
+
+// ── Context cost ──
+
+const WINDOWS = [200_000, 1_000_000];
+
+function Stat({ label, value, hint }: { label: string; value: string; hint?: string }) {
+  return (
+    <div className="app-panel px-4 py-3">
+      <p className="app-section-title mb-1">{label}</p>
+      <p className="text-[17px] font-semibold text-primary leading-none">{value}</p>
+      {hint && <p className="mt-1 text-[12px] text-muted">{hint}</p>}
+    </div>
+  );
+}
+
+function ContextView({ data }: { data: ConfigMapData }) {
+  const { t } = useTranslation();
+  const cost = useMemo(() => listingCost(data), [data]);
+  const [all, setAll] = useState(false);
+  const global = data.memory_files.find((m) => m.path === "~/.claude/CLAUDE.md");
+  const rows = all ? cost.listed : cost.listed.slice(0, 25);
+  return (
+    <div className="space-y-3">
+      <p className="text-[12px] text-muted">{t("configMap.context.intro")}</p>
+      <div className="grid grid-cols-4 gap-3.5">
+        <Stat label={t("configMap.context.listed")} value={String(cost.listed.length)} />
+        <Stat label={t("configMap.context.listing")} value={t("configMap.context.tokens", { count: tokens(cost.chars) })} hint={t("configMap.context.chars", { count: cost.chars })} />
+        <Stat
+          label={t("configMap.context.unused")}
+          value={t("configMap.context.tokens", { count: tokens(cost.unusedChars) })}
+          hint={t("configMap.context.unusedHint", { count: cost.unused.length })}
+        />
+        <Stat label={t("configMap.context.globalMemory")} value={global ? t("configMap.context.tokens", { count: tokens(global.size) }) : "—"} hint="~/.claude/CLAUDE.md" />
+      </div>
+      <div className="app-panel space-y-2.5 px-4 py-3">
+        <p className="app-section-title">{t("configMap.context.budget")}</p>
+        {WINDOWS.map((w) => {
+          const budget = listingBudget(data.listing, w);
+          const share = cost.chars / budget;
+          return (
+            <div key={w}>
+              <div className="flex justify-between text-[12px]">
+                <span className="text-secondary">{t("configMap.context.window", { count: w / 1000 })}</span>
+                <span className={share > 1 ? "text-amber-600 dark:text-amber-400" : "text-muted"}>
+                  {t("configMap.context.ofBudget", { used: cost.chars.toLocaleString(), budget: budget.toLocaleString(), pct: Math.round(share * 100) })}
+                </span>
+              </div>
+              <div className="mt-1 h-1.5 rounded-full bg-surface-hover overflow-hidden">
+                <div className={cn("h-full rounded-full", share > 1 ? "bg-amber-500" : "bg-emerald-500")} style={{ width: `${Math.min(100, share * 100)}%` }} />
+              </div>
+            </div>
+          );
+        })}
+        {cost.chars > listingBudget(data.listing, WINDOWS[0]) && <p className="text-[12px] text-muted">{t("configMap.context.over")}</p>}
+      </div>
+      <div className="app-panel divide-y divide-border-subtle">
+        {rows.map((s) => {
+          const entry = skillUsage(data.usage, s);
+          const state = normalizeState(s.state);
+          return (
+            <div key={s.path} className="flex items-center justify-between gap-3 px-3.5 py-2">
+              <div className="min-w-0">
+                <p className="text-[13px] text-primary truncate">{s.name}</p>
+                <p className="text-[11px] text-muted truncate" title={s.path}>{s.group}</p>
+              </div>
+              <span className="flex items-center gap-1.5 shrink-0">
+                <span className={`text-[11px] px-1.5 py-px rounded-full ${STATE_PILL[state]}`}>{t(`configMap.state.${state}`)}</span>
+                <span className={`text-[12px] ${entry ? "text-muted" : "text-rose-600 dark:text-rose-400"}`}>
+                  {entry ? t("configMap.usage.calls", { count: entry.count }) : t("configMap.usage.never")}
+                </span>
+                <span className="w-16 text-right text-[12px] text-secondary">{t("configMap.context.tokens", { count: tokens(s.listing_chars) })}</span>
+              </span>
+            </div>
+          );
+        })}
+      </div>
+      {!all && cost.listed.length > rows.length && (
+        <button type="button" className="app-button-secondary" onClick={() => setAll(true)}>
+          {t("configMap.context.showAll", { count: cost.listed.length })}
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ── Cleanup ──
+
+type Pending = { kind: "skills" | "projects" } | null;
+
+function CleanupView({ data, onChanged }: { data: ConfigMapData; onChanged: () => Promise<void> }) {
+  const { t } = useTranslation();
+  const cost = useMemo(() => listingCost(data), [data]);
+  // Plugin skills follow their plugin: skillOverrides cannot turn them off.
+  const candidates = cost.unused.filter((s) => s.source !== "plugin");
+  const pluginUnused = cost.unused.length - candidates.length;
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [target, setTarget] = useState<"name-only" | "off">("name-only");
+  const [stale, setStale] = useState<Set<string>>(() => new Set(data.stale_projects));
+  const [pending, setPending] = useState<Pending>(null);
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<{ text: string; error: boolean } | null>(null);
+  const skillConf = useMemo(() => skillConflicts(data.skills), [data.skills]);
+  const mcpConf = useMemo(() => mcpConflicts(data.mcp_servers), [data.mcp_servers]);
+
+  const chosen = candidates.filter((s) => picked.has(s.name));
+  const saved = chosen.reduce((n, s) => n + (target === "off" ? s.listing_chars : s.listing_chars - s.name.length), 0);
+  const flip = (set: Set<string>, key: string) => {
+    const next = new Set(set);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    return next;
+  };
+
+  const apply = async () => {
+    if (!pending) return;
+    setBusy(true);
+    setResult(null);
+    try {
+      const r =
+        pending.kind === "skills"
+          ? await setConfigSkillStates(chosen.map((s) => ({ name: s.name, state: target })))
+          : await removeStaleProjects([...stale]);
+      setResult({ text: t("configMap.cleanup.done", { count: r.changed.length, backup: r.backup ?? "—" }), error: false });
+      setPicked(new Set());
+      setPending(null);
+      await onChanged();
+    } catch (e) {
+      setResult({ text: e && typeof e === "object" && "message" in e ? String(e.message) : String(e), error: true });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const preview =
+    pending?.kind === "skills"
+      ? { file: "~/.claude/settings.json", lines: chosen.map((s) => `skillOverrides.${s.name} = "${target}"`) }
+      : pending?.kind === "projects"
+        ? { file: "~/.claude.json", lines: [...stale].map((p) => `projects["${p}"]`) }
+        : null;
+
+  return (
+    <div className="space-y-4">
+      <p className="text-[12px] text-muted">{t("configMap.cleanup.intro")}</p>
+      {result && <div className={cn("app-panel px-4 py-3 text-[13px] break-all", result.error ? "text-danger" : "text-secondary")}>{result.text}</div>}
+
+      {preview && (
+        <div className="app-panel space-y-2 px-4 py-3">
+          <p className="text-[13px] font-medium text-primary">{t("configMap.cleanup.previewTitle", { file: preview.file })}</p>
+          <ul className="max-h-48 overflow-y-auto text-[12px] text-secondary font-mono">
+            {preview.lines.map((l) => (
+              <li key={l} className="break-all">{pending?.kind === "projects" ? "− " : "± "}{l}</li>
+            ))}
+          </ul>
+          <p className="text-[12px] text-muted">{t("configMap.cleanup.backupNote")}</p>
+          <div className="flex gap-2">
+            <button type="button" className="app-button-primary" disabled={busy} onClick={() => void apply()}>
+              {busy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+              {t("configMap.cleanup.confirm")}
+            </button>
+            <button type="button" className="app-button-secondary" disabled={busy} onClick={() => setPending(null)}>
+              {t("configMap.cleanup.cancel")}
+            </button>
+          </div>
+        </div>
+      )}
+
+      <section>
+        <h2 className="app-section-title mb-1.5">{t("configMap.cleanup.unusedTitle", { count: candidates.length })}</h2>
+        <p className="mb-2 text-[12px] text-muted">{t("configMap.cleanup.unusedHint", { days: data.usage.retention_days })}</p>
+        {pluginUnused > 0 && <p className="mb-2 text-[12px] text-muted">{t("configMap.cleanup.pluginNote", { count: pluginUnused })}</p>}
+        {candidates.length > 0 && (
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <div className="app-segmented w-fit bg-background">
+              {(["name-only", "off"] as const).map((s) => (
+                <button key={s} type="button" className={cn("app-segmented-button", target === s && "app-segmented-button-active")} onClick={() => setTarget(s)}>
+                  {t(`configMap.cleanup.to.${s}`)}
+                </button>
+              ))}
+            </div>
+            <button
+              type="button"
+              className="app-button-secondary"
+              onClick={() => setPicked(picked.size === candidates.length ? new Set() : new Set(candidates.map((s) => s.name)))}
+            >
+              {picked.size === candidates.length ? t("configMap.cleanup.selectNone") : t("configMap.cleanup.selectAll")}
+            </button>
+            <button type="button" className="app-button-primary" disabled={chosen.length === 0 || busy} onClick={() => setPending({ kind: "skills" })}>
+              {t("configMap.cleanup.applySkills", { count: chosen.length, tokens: tokens(saved) })}
+            </button>
+          </div>
+        )}
+        <div className="app-panel divide-y divide-border-subtle">
+          {candidates.map((s) => (
+            <label key={s.path} className="flex items-center gap-2.5 px-3.5 py-2 cursor-pointer hover:bg-surface-hover">
+              <input type="checkbox" className="h-4 w-4 shrink-0 accent-accent" checked={picked.has(s.name)} onChange={() => setPicked(flip(picked, s.name))} />
+              <span className="min-w-0 flex-1">
+                <span className="block text-[13px] text-primary truncate">{s.name}</span>
+                <span className="block text-[11px] text-muted truncate">{s.description}</span>
+              </span>
+              <span className="shrink-0 text-[12px] text-secondary">{t("configMap.context.tokens", { count: tokens(s.listing_chars) })}</span>
+            </label>
+          ))}
+          {candidates.length === 0 && <p className="px-3.5 py-3 text-[13px] text-muted">{t("configMap.empty")}</p>}
+        </div>
+      </section>
+
+      <section>
+        <h2 className="app-section-title mb-1.5">{t("configMap.cleanup.staleTitle", { count: data.stale_projects.length })}</h2>
+        <p className="mb-2 text-[12px] text-muted">{t("configMap.cleanup.staleHint")}</p>
+        {data.stale_projects.length > 0 && (
+          <button type="button" className="app-button-primary mb-2" disabled={stale.size === 0 || busy} onClick={() => setPending({ kind: "projects" })}>
+            {t("configMap.cleanup.applyProjects", { count: stale.size })}
+          </button>
+        )}
+        <div className="app-panel divide-y divide-border-subtle">
+          {data.stale_projects.map((p) => (
+            <label key={p} className="flex items-center gap-2.5 px-3.5 py-2 cursor-pointer hover:bg-surface-hover">
+              <input type="checkbox" className="h-4 w-4 shrink-0 accent-accent" checked={stale.has(p)} onChange={() => setStale(flip(stale, p))} />
+              <span className="text-[13px] text-secondary font-mono break-all">{p}</span>
+            </label>
+          ))}
+          {data.stale_projects.length === 0 && <p className="px-3.5 py-3 text-[13px] text-muted">{t("configMap.empty")}</p>}
+        </div>
+      </section>
+
+      <section>
+        <h2 className="app-section-title mb-1.5">{t("configMap.cleanup.brokenTitle", { count: data.broken_links.length })}</h2>
+        <p className="mb-2 text-[12px] text-muted">{t("configMap.cleanup.brokenHint")}</p>
+        <div className="app-panel divide-y divide-border-subtle">
+          {data.broken_links.map((b) => (
+            <div key={b.path} className="px-3.5 py-2 font-mono text-[12px]">
+              <p className="text-primary break-all">{b.path}</p>
+              <p className="text-muted break-all">→ {b.target}</p>
+            </div>
+          ))}
+          {data.broken_links.length === 0 && <p className="px-3.5 py-3 text-[13px] text-muted">{t("configMap.empty")}</p>}
+        </div>
+      </section>
+
+      <section>
+        <h2 className="app-section-title mb-1.5">{t("configMap.cleanup.conflictsTitle", { count: skillConf.length + mcpConf.length })}</h2>
+        <p className="mb-2 text-[12px] text-muted">{t("configMap.cleanup.conflictsHint")}</p>
+        <div className="app-panel divide-y divide-border-subtle">
+          {[...skillConf.map((c) => ({ ...c, kind: "skill" as const })), ...mcpConf.map((c) => ({ ...c, kind: "mcp" as const }))].map((c) => (
+            <div key={`${c.kind}:${c.agent}:${c.name}`} className="px-3.5 py-2">
+              <p className="flex items-center gap-1.5">
+                <span className={`text-[11px] px-1.5 py-px rounded-full ${c.kind === "skill" ? ITEM_PILL.skill : ITEM_PILL.mcp}`}>{t(`configMap.cleanup.kind.${c.kind}`)}</span>
+                {c.agent !== "claude" && <span className="text-[11px] px-1.5 py-px rounded-full bg-surface-hover text-muted border border-border-subtle">{c.agent}</span>}
+                <span className="text-[13px] text-primary">{c.name}</span>
+              </p>
+              {c.places.map((pl) => (
+                <p key={pl} className="text-[12px] text-muted font-mono break-all">{pl}</p>
+              ))}
+            </div>
+          ))}
+          {skillConf.length + mcpConf.length === 0 && <p className="px-3.5 py-3 text-[13px] text-muted">{t("configMap.empty")}</p>}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+// ── Effective config for a folder ──
+
+function EffectivePanel({ data, folder, onClose }: { data: ConfigMapData; folder: string; onClose: () => void }) {
+  const { t } = useTranslation();
+  const eff = useMemo(() => effectiveConfig(data, folder), [data, folder]);
+  return (
+    <aside className="app-panel sticky top-0 w-80 shrink-0 space-y-3 px-4 py-3">
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <p className="text-[11px] uppercase tracking-wide text-muted">{t("configMap.effective.title")}</p>
+          <p className="text-[13px] font-medium text-primary break-all">{folder}</p>
+        </div>
+        <button type="button" className={ICON_BUTTON} onClick={onClose} aria-label={t("configMap.close")}><X className="w-4 h-4" /></button>
+      </div>
+      <div className="space-y-1 text-[13px]">
+        <p className="flex justify-between text-muted"><span>{t("configMap.effective.skills")}</span><span className="text-secondary">{eff.skills}</span></p>
+        <p className="flex justify-between text-muted"><span>{t("configMap.effective.mcp")}</span><span className="text-secondary">{eff.mcp.length}</span></p>
+        <p className="flex justify-between text-muted"><span>{t("configMap.effective.memory")}</span><span className="text-secondary">{t("configMap.context.tokens", { count: tokens(eff.memoryChars) })}</span></p>
+      </div>
+      <div>
+        <p className="app-section-title mb-1">{t("configMap.effective.memoryFiles")}</p>
+        {eff.memory.map((m) => (
+          <p key={m.path} className="flex justify-between gap-2 text-[12px]">
+            <span className="text-secondary font-mono truncate" title={m.path}>{m.path}</span>
+            <span className="flex shrink-0 items-center gap-1 text-muted">
+              {m.symlink && <span className="text-[11px] px-1.5 py-px rounded-full bg-violet-500/10 text-violet-600 dark:text-violet-400">{t("configMap.symlink")}</span>}
+              {t("configMap.context.tokens", { count: tokens(m.size) })}
+            </span>
+          </p>
+        ))}
+      </div>
+      {eff.dotDirs.length > 0 && (
+        <div>
+          <p className="app-section-title mb-1">{t("configMap.effective.projectDirs")}</p>
+          {eff.dotDirs.map((d) => (
+            <p key={d.path} className="text-[12px] text-secondary font-mono break-all">{d.path} · {d.skills}</p>
+          ))}
+        </div>
+      )}
+      <div>
+        <p className="app-section-title mb-1">{t("configMap.effective.mcpList")}</p>
+        <div className="flex flex-wrap gap-1">
+          {eff.mcp.map((s) => (
+            <span key={`${s.defined_in}:${s.name}`} title={s.defined_in} className="text-[11px] px-1.5 py-px rounded-full bg-amber-500/10 text-amber-600 dark:text-amber-400">{s.name}</span>
+          ))}
+        </div>
+      </div>
+      <p className="text-[11px] text-muted">{t("configMap.effective.note")}</p>
+    </aside>
   );
 }
