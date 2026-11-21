@@ -1004,6 +1004,8 @@ pub fn run() {
             commands::tools::get_tool_status,
             // Config map (read-only)
             commands::config_map::get_config_map,
+            commands::config_map_edit::config_map_set_skill_states,
+            commands::config_map_edit::config_map_remove_stale_projects,
             commands::tools::set_tool_enabled,
             commands::tools::set_all_tools_enabled,
             commands::tools::get_tool_order_cmd,
